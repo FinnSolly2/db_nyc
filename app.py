@@ -93,8 +93,14 @@ mongo_client = get_mongo_client()
 
 # Function to load data for each query
 @st.cache_data(ttl=3600)
-def get_top_cuisines_by_inspection_score():
-    """Query 1: Top 10 cuisines with the highest average inspection scores"""
+def get_top_cuisines_by_inspection_score(min_inspections=10, limit=10, sort_order=-1):
+    """Query 1: Top cuisines with the highest/lowest average inspection scores
+    
+    Parameters:
+    min_inspections (int): Minimum number of inspections required for a cuisine to be included
+    limit (int): Number of cuisines to return
+    sort_order (int): -1 for highest scores first, 1 for lowest scores first
+    """
     db = mongo_client["restaurant_inspections"]
     collection = db["inspections"]
     
@@ -116,9 +122,9 @@ def get_top_cuisines_by_inspection_score():
                 'inspectionCount': { '$sum': 1 }
             }
         },
-        { '$match': { 'inspectionCount': { '$gte': 10 } } },
-        { '$sort': { 'averageScore': -1 } },
-        { '$limit': 10 },
+        { '$match': { 'inspectionCount': { '$gte': min_inspections } } },
+        { '$sort': { 'averageScore': sort_order } },
+        { '$limit': limit },
         {
             '$project': {
                 '_id': 0, 
@@ -133,13 +139,25 @@ def get_top_cuisines_by_inspection_score():
     return pd.DataFrame(result)
 
 @st.cache_data(ttl=3600)
-def get_manhattan_critical_violations():
-    """Query 2: 10 most common critical violations in Manhattan restaurants"""
+def get_borough_critical_violations(borough='Manhattan', limit=10, critical_flag='Critical'):
+    """Query 2: Most common violations in a selected borough's restaurants
+    
+    Parameters:
+    borough (str): Borough to analyze ('Manhattan', 'Brooklyn', 'Queens', 'Bronx', 'Staten Island')
+    limit (int): Number of violation types to return
+    critical_flag (str): 'Critical', 'Not Critical', or 'All'
+    """
     db = mongo_client["restaurant_inspections"]
     collection = db["violations"]
     
+    # Build match condition for critical flag
+    if critical_flag == 'All':
+        critical_match = {}
+    else:
+        critical_match = { 'CRITICAL FLAG': critical_flag }
+    
     pipeline = [
-        { '$match': { 'CRITICAL FLAG': 'Critical' } },
+        { '$match': critical_match },
         {
             '$lookup': {
                 'from': 'inspections', 
@@ -158,7 +176,7 @@ def get_manhattan_critical_violations():
             }
         },
         { '$unwind': '$restaurant' },
-        { '$match': { 'restaurant.BORO': 'Manhattan' } },
+        { '$match': { 'restaurant.BORO': borough } },
         {
             '$group': {
                 '_id': {
@@ -169,7 +187,7 @@ def get_manhattan_critical_violations():
             }
         },
         { '$sort': { 'count': -1 } },
-        { '$limit': 10 },
+        { '$limit': limit },
         {
             '$project': {
                 '_id': 0, 
@@ -272,8 +290,15 @@ def get_borough_grade_distribution():
     return pd.DataFrame(processed_data)
 
 @st.cache_data(ttl=3600)
-def get_most_improved_restaurants():
-    """Query 4: 20 Most improved inspection scores over time"""
+def get_most_improved_restaurants(min_inspections=2, limit=20, borough=None, min_improvement=0):
+    """Query 4: Most improved inspection scores over time
+    
+    Parameters:
+    min_inspections (int): Minimum number of inspections required for a restaurant
+    limit (int): Number of restaurants to return
+    borough (str or None): Filter by borough (None for all boroughs)
+    min_improvement (int): Minimum improvement score to consider
+    """
     db = mongo_client["restaurant_inspections"]
     collection = db["inspections"]
     
@@ -303,9 +328,11 @@ def get_most_improved_restaurants():
                 'improvement': { '$subtract': ['$firstScore', '$lastScore'] }
             }
         },
-        { '$match': { 'inspectionCount': { '$gte': 2 } } },
+        { '$match': { 
+            'inspectionCount': { '$gte': min_inspections },
+            'improvement': { '$gte': min_improvement }
+        }},
         { '$sort': { 'improvement': -1 } },
-        { '$limit': 20 },
         {
             '$lookup': {
                 'from': 'establishments', 
@@ -314,7 +341,16 @@ def get_most_improved_restaurants():
                 'as': 'restaurant'
             }
         },
-        { '$unwind': '$restaurant' },
+        { '$unwind': '$restaurant' }
+    ]
+    
+    # Add borough filter if specified
+    if borough:
+        pipeline.append({'$match': {'restaurant.BORO': borough}})
+    
+    # Add limit and projection
+    pipeline.extend([
+        { '$limit': limit },
         {
             '$project': {
                 '_id': 0, 
@@ -328,7 +364,7 @@ def get_most_improved_restaurants():
                 'inspectionCount': 1
             }
         }
-    ]
+    ])
     
     result = list(collection.aggregate(pipeline))
     return pd.DataFrame(result)
@@ -599,20 +635,66 @@ if selected == "Home":
 
 # Top Cuisines by Inspection Score
 elif selected == "Top Cuisines":
-    st.header("Top Cuisines by Inspection Score")
+    st.header("Cuisines by Inspection Score")
     st.info("💡 **Note**: Lower scores are better! A score of 0-13 is an 'A', 14-27 is a 'B', and scores over 28 are failing.")
     
-    # Load data
+    # Add user controls
+    st.sidebar.markdown("## Query Parameters")
+    with st.sidebar.expander("Cuisine Query Options", expanded=True):
+        # Minimum inspections slider
+        min_inspections = st.slider(
+            "Minimum Inspections Required", 
+            min_value=5, 
+            max_value=100, 
+            value=10, 
+            step=5,
+            help="Only include cuisines with at least this many inspections"
+        )
+        
+        # Number of cuisines to show
+        limit = st.slider(
+            "Number of Cuisines to Show", 
+            min_value=5, 
+            max_value=30, 
+            value=10,
+            help="Number of cuisine types to display in the results"
+        )
+        
+        # Sort order
+        sort_order = st.radio(
+            "Sort Order",
+            options=["Highest Scores First (Worst Performance)", 
+                     "Lowest Scores First (Best Performance)"],
+            index=0,
+            help="Highest scores are worse for food safety"
+        )
+        
+        sort_value = -1 if sort_order == "Highest Scores First (Worst Performance)" else 1
+    
+    # Load data with user parameters
     with st.spinner("Loading cuisine data..."):
-        df_cuisines = get_top_cuisines_by_inspection_score()
+        df_cuisines = get_top_cuisines_by_inspection_score(
+            min_inspections=min_inspections, 
+            limit=limit, 
+            sort_order=sort_value
+        )
     
     # Display data
     col1, col2 = st.columns([2, 1])
     
     with col1:
         # Create horizontal bar chart
+        # If lowest first, we need to sort in ascending order for the chart
+        display_df = df_cuisines.sort_values('averageScore', ascending=(sort_value == 1))
+        
+        chart_title = "Cuisine Types by Average Inspection Score (Lower is Better)"
+        if sort_value == 1:
+            chart_title = "Best Performing Cuisines (Lowest Average Scores)"
+        else:
+            chart_title = "Worst Performing Cuisines (Highest Average Scores)"
+        
         fig = px.bar(
-            df_cuisines.sort_values('averageScore'),
+            display_df,
             y='cuisine',
             x='averageScore',
             color='averageScore',
@@ -623,7 +705,7 @@ elif selected == "Top Cuisines":
         )
         
         fig.update_layout(
-            title="Cuisine Types by Average Inspection Score (Lower is Better)",
+            title=chart_title,
             xaxis_title="Average Score",
             yaxis_title="Cuisine Type",
             yaxis={'categoryorder': 'total ascending'},
@@ -639,88 +721,235 @@ elif selected == "Top Cuisines":
             hovertemplate="<b>%{y}</b><br>Average Score: %{x:.1f}<br>Inspection Count: %{customdata[0]:,}"
         )
         
-        fig.update_traces(customdata=df_cuisines[['inspectionCount']])
+        fig.update_traces(customdata=display_df[['inspectionCount']])
         
         st.plotly_chart(fig, use_container_width=True)
-    
+        
     with col2:
         st.subheader("Insights")
-        st.write("""
-        - Lower scores indicate better health inspection results.
-        - A score of 0-13 earns an "A" grade.
-        - 14-27 earns a "B" grade.
-        - 28+ is considered failing.
         
-        The chart shows cuisines with the highest (worst) average inspection scores.
+        # Calculate A-grade eligible cuisines
+        a_grade_eligible = df_cuisines[df_cuisines['averageScore'] <= 13]
+        a_grade_pct = len(a_grade_eligible) / len(df_cuisines) * 100 if len(df_cuisines) > 0 else 0
+        
+        st.markdown(f"""
+        **From your selection:**
+        - {a_grade_pct:.1f}% of cuisines have an average score in the 'A' grade range.
+        - Minimum inspections per cuisine: {min_inspections}
+        - Number of cuisines shown: {limit}
+        
+        **Score Interpretation:**
+        - **Lower scores** indicate better health inspection results
+        - **0-13**: 'A' grade (Good)
+        - **14-27**: 'B' grade (Fair)
+        - **28+**: 'C' grade or failing (Poor)
         """)
         
         st.markdown("### Data Table")
         # Format the dataframe for display
         display_df = df_cuisines.copy()
+        
+        # Add a grade column
+        def get_grade(score):
+            if score <= 13:
+                return "A"
+            elif score <= 27:
+                return "B"
+            else:
+                return "C"
+                
+        display_df['grade'] = display_df['averageScore'].apply(get_grade)
         display_df['averageScore'] = display_df['averageScore'].apply(lambda x: f"{x:.1f}")
         display_df['inspectionCount'] = display_df['inspectionCount'].apply(lambda x: f"{x:,}")
-        display_df.columns = ['Cuisine Type', 'Average Score', 'Inspection Count']
+        display_df.columns = ['Cuisine Type', 'Average Score', 'Inspection Count', 'Grade']
         
-        st.dataframe(display_df.sort_values('Average Score', ascending=True), use_container_width=True)
+        # Reorder columns
+        display_df = display_df[['Cuisine Type', 'Grade', 'Average Score', 'Inspection Count']]
+        
+        st.dataframe(display_df, use_container_width=True)
+        
+        # Download button
+        csv = display_df.to_csv(index=False)
+        st.download_button(
+            label="Download Data as CSV",
+            data=csv,
+            file_name="cuisine_inspection_scores.csv",
+            mime="text/csv"
+        )
 
-# Critical Violations in Manhattan
+# Critical Violations by Borough
 elif selected == "Critical Violations":
-    st.header("Most Common Critical Violations in Manhattan Restaurants")
+    st.header("Most Common Violations by Borough")
     
-    # Load data
-    with st.spinner("Loading violation data..."):
-        df_violations = get_manhattan_critical_violations()
+    # Add user controls
+    st.sidebar.markdown("## Query Parameters")
+    with st.sidebar.expander("Violation Query Options", expanded=True):
+        # Borough selection
+        borough_options = ['Manhattan', 'Brooklyn', 'Queens', 'Bronx', 'Staten Island']
+        selected_borough = st.selectbox(
+            "Select Borough",
+            options=borough_options,
+            index=0,
+            help="Borough to analyze for violations"
+        )
+        
+        # Violation type
+        violation_type = st.radio(
+            "Violation Type",
+            options=["Critical", "Not Critical", "All"],
+            index=0,
+            help="Critical violations are more likely to contribute to foodborne illness"
+        )
+        
+        # Number of violations to show
+        limit = st.slider(
+            "Number of Violations to Show", 
+            min_value=5, 
+            max_value=30, 
+            value=10,
+            help="Number of violation types to display in the results"
+        )
+    
+    # Load data with user parameters
+    with st.spinner(f"Loading violation data for {selected_borough}..."):
+        df_violations = get_borough_critical_violations(
+            borough=selected_borough,
+            limit=limit,
+            critical_flag=violation_type
+        )
     
     # Process data for better visualization
     df_violations['shortDescription'] = df_violations['violationDescription'].apply(
         lambda x: x[:80] + '...' if len(x) > 80 else x
     )
     
-    col1, col2 = st.columns([2, 1])
+    # Create main content
+    tab1, tab2 = st.tabs(["Chart View", "Data Table"])
     
-    with col1:
-        # Create horizontal bar chart
-        fig = px.bar(
-            df_violations.sort_values('count'),
-            y='shortDescription',
-            x='count',
-            color='count',
-            color_continuous_scale=px.colors.sequential.Reds,
-            labels={'count': 'Occurrence Count', 'shortDescription': 'Violation Type'},
-            height=600,
-            text='count'
-        )
+    with tab1:
+        col1, col2 = st.columns([2, 1])
         
-        fig.update_layout(
-            title="Most Common Critical Violations in Manhattan Restaurants",
-            xaxis_title="Number of Violations",
-            yaxis_title="Violation Type",
-            yaxis={'categoryorder': 'total ascending'},
-            coloraxis_colorbar=dict(title="Count"),
-            font=dict(family="Arial", size=14),
-            plot_bgcolor='white',
-            hoverlabel=dict(font_size=14, font_family="Arial")
-        )
+        with col1:
+            # Create horizontal bar chart
+            fig = px.bar(
+                df_violations.sort_values('count'),
+                y='shortDescription',
+                x='count',
+                color='count',
+                color_continuous_scale=px.colors.sequential.Reds,
+                labels={'count': 'Occurrence Count', 'shortDescription': 'Violation Type'},
+                height=600,
+                text='count'
+            )
+            
+            title_prefix = ""
+            if violation_type != "All":
+                title_prefix = f"Most Common {violation_type} "
+            else:
+                title_prefix = "Most Common "
+                
+            fig.update_layout(
+                title=f"{title_prefix}Violations in {selected_borough} Restaurants",
+                xaxis_title="Number of Violations",
+                yaxis_title="Violation Type",
+                yaxis={'categoryorder': 'total ascending'},
+                coloraxis_colorbar=dict(title="Count"),
+                font=dict(family="Arial", size=14),
+                plot_bgcolor='white',
+                hoverlabel=dict(font_size=14, font_family="Arial")
+            )
+            
+            fig.update_traces(
+                texttemplate='%{x:,}',
+                textposition='outside',
+                hovertemplate="<b>Violation Code: %{customdata[0]}</b><br>Count: %{x:,}<br>%{customdata[1]}"
+            )
+            
+            fig.update_traces(customdata=df_violations[['violationCode', 'violationDescription']])
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Pie chart of violation codes
+            st.subheader("Violations by Code")
+            
+            fig = px.pie(
+                df_violations,
+                values='count',
+                names='violationCode',
+                color_discrete_sequence=px.colors.qualitative.Set3,
+                hole=0.4
+            )
+            
+            fig.update_layout(
+                title=f"Distribution of Violation Codes in {selected_borough}",
+                font=dict(family="Arial", size=14),
+                legend=dict(orientation="h", y=-0.1),
+                hoverlabel=dict(font_size=14, font_family="Arial"),
+                height=400
+            )
+            
+            fig.update_traces(
+                textinfo='percent+label',
+                hovertemplate="<b>Code %{label}</b><br>Count: %{value}<br>Percentage: %{percent}"
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
         
-        fig.update_traces(
-            texttemplate='%{x:,}',
-            textposition='outside',
-            hovertemplate="<b>Violation Code: %{customdata[0]}</b><br>Count: %{x:,}<br>%{customdata[1]}"
-        )
-        
-        fig.update_traces(customdata=df_violations[['violationCode', 'violationDescription']])
-        
-        st.plotly_chart(fig, use_container_width=True)
+        with col2:
+            st.subheader("Insights")
+            
+            # Count total violations
+            total_violations = df_violations['count'].sum()
+            
+            st.write(f"""
+            **{selected_borough} Violation Analysis:**
+            
+            This visualization shows the most common {violation_type.lower() if violation_type != "All" else ""} 
+            violations found during inspections of restaurants in {selected_borough}.
+            
+            **Total violations shown:** {total_violations:,}
+            
+            {
+            "Critical violations are those that are more likely to contribute to foodborne illness and must be corrected immediately." 
+            if violation_type == "Critical" else 
+            "Non-critical violations are less likely to contribute directly to foodborne illness but still represent health code issues."
+            if violation_type == "Not Critical" else
+            "This view shows both critical and non-critical violations. Critical violations are more likely to contribute to foodborne illness."
+            }
+            """)
+            
+            st.markdown("### Top Violation Codes")
+            top_codes = df_violations.groupby('violationCode')['count'].sum().reset_index()
+            top_codes = top_codes.sort_values('count', ascending=False).head(5)
+            
+            for i, row in top_codes.iterrows():
+                code = row['violationCode']
+                count = row['count']
+                description = df_violations[df_violations['violationCode'] == code]['violationDescription'].iloc[0]
+                
+                st.markdown(f"**Code {code}** ({count:,} violations)")
+                st.markdown(f"<div style='margin-left: 20px; font-style: italic;'>{description}</div>", unsafe_allow_html=True)
+                st.markdown("---")
     
-    with col2:
-        st.subheader("Insights")
-        st.write("""
-        Critical violations are those that are more likely to contribute to 
-        foodborne illness. These violations must be corrected immediately.
+    with tab2:
+        st.subheader("Detailed Violation Data")
         
-        The chart shows the most common critical violations found during
-        inspections of Manhattan restaurants.
-        """)
+        # Format the dataframe for display
+        display_df = df_violations.copy()
+        display_df['count'] = display_df['count'].apply(lambda x: f"{x:,}")
+        display_df = display_df[['violationCode', 'violationDescription', 'count']]
+        display_df.columns = ['Violation Code', 'Violation Description', 'Count']
+        
+        st.dataframe(display_df, use_container_width=True)
+        
+        # Download button
+        csv = display_df.to_csv(index=False)
+        st.download_button(
+            label="Download Data as CSV",
+            data=csv,
+            file_name=f"{selected_borough}_violations_{violation_type}.csv",
+            mime="text/csv"
+        )
         
         st.markdown("### Full Descriptions")
         for i, row in df_violations.iterrows():
@@ -915,14 +1144,66 @@ elif selected == "Most Improved":
     st.header("Most Improved Restaurants Over Time")
     st.info("💡 **Remember**: Lower scores are better! Improvement is defined as a reduction in score over time. Higher improvement values indicate greater progress.")
     
-    # Load data
+    # Add user controls
+    st.sidebar.markdown("## Query Parameters")
+    with st.sidebar.expander("Improvement Query Options", expanded=True):
+        # Borough filter
+        borough_options = ['All Boroughs', 'Manhattan', 'Brooklyn', 'Queens', 'Bronx', 'Staten Island']
+        selected_borough = st.selectbox(
+            "Filter by Borough",
+            options=borough_options,
+            index=0,
+            help="Select a borough or view all"
+        )
+        
+        # Minimum improvement
+        min_improvement = st.slider(
+            "Minimum Score Improvement", 
+            min_value=0, 
+            max_value=50, 
+            value=0,
+            help="Only show restaurants with at least this much improvement"
+        )
+        
+        # Minimum inspections
+        min_inspections = st.slider(
+            "Minimum Number of Inspections", 
+            min_value=2, 
+            max_value=10, 
+            value=2,
+            help="Only include restaurants with at least this many inspections"
+        )
+        
+        # Number of restaurants to show
+        limit = st.slider(
+            "Number of Restaurants to Show", 
+            min_value=5, 
+            max_value=50, 
+            value=20,
+            help="Number of restaurants to display in the results"
+        )
+    
+    # Process borough filter
+    filter_borough = None if selected_borough == 'All Boroughs' else selected_borough
+    
+    # Load data with user parameters
     with st.spinner("Loading improvement data..."):
-        df_improved = get_most_improved_restaurants()
+        df_improved = get_most_improved_restaurants(
+            min_inspections=min_inspections,
+            limit=limit,
+            borough=filter_borough,
+            min_improvement=min_improvement
+        )
+    
+    # Check if data was found
+    if len(df_improved) == 0:
+        st.warning(f"No restaurants found matching the criteria. Try adjusting the filters.")
+        st.stop()
     
     # Create visualization
-    col1, col2 = st.columns([2, 1])
+    tab1, tab2 = st.tabs(["Improvement Charts", "Restaurant Details"])
     
-    with col1:
+    with tab1:
         # Create custom visualization showing before/after scores
         fig = go.Figure()
         
@@ -947,9 +1228,14 @@ elif selected == "Most Improved":
         # Add custom data for hover info
         fig.update_traces(customdata=df_improved[['borough', 'cuisine']])
         
+        # Add title with filter information
+        title = "Most Improved Restaurants: First vs. Latest Inspection Scores"
+        if filter_borough:
+            title += f" in {filter_borough}"
+        
         # Set layout
         fig.update_layout(
-            title="Most Improved Restaurants: First vs. Latest Inspection Scores",
+            title=title,
             xaxis_title="Restaurant",
             yaxis_title="Inspection Score",
             barmode='group',
@@ -1006,68 +1292,199 @@ elif selected == "Most Improved":
         fig.update_traces(customdata=df_improved[['borough', 'cuisine']])
         
         st.plotly_chart(fig, use_container_width=True)
+        
+        # Borough distribution
+        if not filter_borough:
+            st.subheader("Borough Distribution")
+            # Create pie chart of most improved restaurants by borough
+            borough_counts = df_improved['borough'].value_counts().reset_index()
+            borough_counts.columns = ['Borough', 'Count']
+            
+            fig = px.pie(
+                borough_counts,
+                values='Count',
+                names='Borough',
+                color_discrete_sequence=px.colors.qualitative.Set3,
+                hole=0.4
+            )
+            
+            fig.update_layout(
+                title="Most Improved Restaurants by Borough",
+                font=dict(family="Arial", size=14),
+                hoverlabel=dict(font_size=14, font_family="Arial")
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
     
-    with col2:
-        st.subheader("Insights")
-        st.write("""
-        This section highlights restaurants that have shown the most improvement in their inspection scores over time.
+    with tab2:
+        st.subheader("Restaurant Details")
         
-        **Remember:**
-        - Lower scores are better
-        - A score of 0-13 is an "A" grade
-        - Scores over 28 are failing
+        # Format the dataframe for display
+        display_df = df_improved.copy()
+        display_df = display_df.rename(columns={
+            'name': 'Restaurant Name',
+            'borough': 'Borough',
+            'cuisine': 'Cuisine Type',
+            'firstScore': 'Initial Score',
+            'lastScore': 'Latest Score',
+            'improvement': 'Improvement',
+            'inspectionCount': 'Number of Inspections'
+        })
         
-        "Improvement" is calculated as the difference between the first and latest inspection scores. A higher improvement value indicates greater progress.
-        """)
+        # Calculate grades
+        def get_grade(score):
+            if score <= 13:
+                return "A"
+            elif score <= 27:
+                return "B"
+            else:
+                return "C"
+                
+        display_df['Initial Grade'] = display_df['Initial Score'].apply(get_grade)
+        display_df['Latest Grade'] = display_df['Latest Score'].apply(get_grade)
         
-        st.markdown("### Borough Distribution")
-        # Create pie chart of most improved restaurants by borough
-        borough_counts = df_improved['borough'].value_counts().reset_index()
-        borough_counts.columns = ['Borough', 'Count']
+        # Reorder columns
+        display_df = display_df[[
+            'Restaurant Name', 'Borough', 'Cuisine Type', 
+            'Initial Score', 'Initial Grade', 'Latest Score', 'Latest Grade',
+            'Improvement', 'Number of Inspections'
+        ]]
         
-        fig = px.pie(
-            borough_counts,
-            values='Count',
-            names='Borough',
-            color_discrete_sequence=px.colors.qualitative.Set3,
-            hole=0.4
+        st.dataframe(display_df, use_container_width=True)
+        
+        # Download button
+        csv = display_df.to_csv(index=False)
+        st.download_button(
+            label="Download Data as CSV",
+            data=csv,
+            file_name="most_improved_restaurants.csv",
+            mime="text/csv"
         )
         
-        fig.update_layout(
-            title="Most Improved Restaurants by Borough",
-            font=dict(family="Arial", size=14),
-            hoverlabel=dict(font_size=14, font_family="Arial")
-        )
+        # Restaurant spotlights
+        st.subheader("Restaurant Spotlight")
         
-        st.plotly_chart(fig, use_container_width=True)
+        # Get top 5 most improved
+        top_improved = df_improved.head(5)
         
-        st.markdown("### Cuisine Distribution")
-        # Create bar chart of most improved restaurants by cuisine
-        cuisine_counts = df_improved['cuisine'].value_counts().reset_index()
-        cuisine_counts.columns = ['Cuisine', 'Count']
-        cuisine_counts = cuisine_counts.sort_values('Count', ascending=False).head(10)
-        
-        fig = px.bar(
-            cuisine_counts,
-            x='Count',
-            y='Cuisine',
-            orientation='h',
-            color='Count',
-            color_continuous_scale=px.colors.sequential.Viridis,
-            labels={'Count': 'Number of Restaurants', 'Cuisine': 'Cuisine Type'},
-            height=400
-        )
-        
-        fig.update_layout(
-            title="Top Cuisines Among Most Improved",
-            xaxis_title="Number of Restaurants",
-            yaxis_title="Cuisine Type",
-            font=dict(family="Arial", size=14),
-            plot_bgcolor='white',
-            hoverlabel=dict(font_size=14, font_family="Arial")
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
+        for i, row in top_improved.iterrows():
+            with st.expander(f"{row['name']} - Improved by {row['improvement']} points"):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown(f"**Borough:** {row['borough']}")
+                    st.markdown(f"**Cuisine:** {row['cuisine']}")
+                    st.markdown(f"**Inspections:** {row['inspectionCount']}")
+                
+                with col2:
+                    # Calculate grades
+                    first_grade = get_grade(row['firstScore'])
+                    last_grade = get_grade(row['lastScore'])
+                    
+                    st.markdown(f"**First Score:** {row['firstScore']} (Grade {first_grade})")
+                    st.markdown(f"**Latest Score:** {row['lastScore']} (Grade {last_grade})")
+                    st.markdown(f"**Improvement:** {row['improvement']} points")
+                
+                # Add a progress visualization
+                st.markdown("### Improvement Visualization")
+                
+                max_score = max(row['firstScore'], 50)  # Cap at 50 for visualization purposes
+                
+                # Create a progress chart
+                progress_data = pd.DataFrame({
+                    'Stage': ['First Inspection', 'Latest Inspection'],
+                    'Score': [row['firstScore'], row['lastScore']],
+                    'Color': ['#e74c3c', '#2ecc71']
+                })
+                
+                fig = px.bar(
+                    progress_data,
+                    x='Score',
+                    y='Stage',
+                    orientation='h',
+                    color='Color',
+                    color_discrete_map={'#e74c3c': '#e74c3c', '#2ecc71': '#2ecc71'},
+                    height=150,
+                    range_x=[0, max_score]
+                )
+                
+                # Add grade bands to the background
+                fig.add_shape(
+                    type="rect",
+                    x0=0, x1=13,
+                    y0=-0.5, y1=1.5,
+                    fillcolor="#2ecc71",
+                    opacity=0.2,
+                    layer="below",
+                    line_width=0
+                )
+                
+                fig.add_shape(
+                    type="rect",
+                    x0=14, x1=27,
+                    y0=-0.5, y1=1.5,
+                    fillcolor="#f39c12",
+                    opacity=0.2,
+                    layer="below",
+                    line_width=0
+                )
+                
+                fig.add_shape(
+                    type="rect",
+                    x0=28, x1=max_score,
+                    y0=-0.5, y1=1.5,
+                    fillcolor="#e74c3c",
+                    opacity=0.2,
+                    layer="below",
+                    line_width=0
+                )
+                
+                # Add labels for grade bands
+                fig.add_annotation(
+                    x=6.5, y=1.4,
+                    text="A Grade (0-13)",
+                    showarrow=False,
+                    font=dict(color="#2c3e50", size=10)
+                )
+                
+                fig.add_annotation(
+                    x=20.5, y=1.4,
+                    text="B Grade (14-27)",
+                    showarrow=False,
+                    font=dict(color="#2c3e50", size=10)
+                )
+                
+                fig.add_annotation(
+                    x=39, y=1.4,
+                    text="C Grade (28+)",
+                    showarrow=False,
+                    font=dict(color="#2c3e50", size=10)
+                )
+                
+                # Update layout
+                fig.update_layout(
+                    showlegend=False,
+                    xaxis_title="Inspection Score (Lower is Better)",
+                    xaxis=dict(
+                        showgrid=False,
+                        zeroline=False
+                    ),
+                    yaxis=dict(
+                        showgrid=False,
+                        zeroline=False
+                    ),
+                    plot_bgcolor="white",
+                    margin=dict(l=0, r=0, t=10, b=0)
+                )
+                
+                fig.update_traces(
+                    texttemplate='%{x}',
+                    textposition='outside',
+                    hovertemplate="<b>%{y}</b><br>Score: %{x}<extra></extra>",
+                    width=0.6
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
 
 # Cuisine Violations
 elif selected == "Cuisine Violations":
@@ -1314,8 +1731,3 @@ else:
     The MongoDB aggregation pipelines perform complex data transformations and analyses, which are then visualized in the dashboard.
     """)
     
-    st.info("""
-    **Data Source**: NYC Department of Health and Mental Hygiene's restaurant inspection data
-    
-    **Note**: The dashboard uses MongoDB for data storage and retrieval. The connection string should be provided in the Streamlit secrets manager.
-    """)
